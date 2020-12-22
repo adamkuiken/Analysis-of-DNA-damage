@@ -1,0 +1,464 @@
+---
+title: "Project 2"
+author: "Adam Kuiken"
+date: "11/23/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+
+library(openxlsx)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(philentropy)
+library(MASS)
+library(class)
+library(tidyverse)
+library(pracma)
+library(tree)
+library(class)
+
+setwd("C:/Users/adkui/Desktop/PennState/course/PROJECT2") #altered address for discretion
+wd = getwd()
+wd
+#Read in first file
+df <- read.csv("Data_Project2.csv", header = TRUE, sep = ",", quote = "\"", dec = ".", fill = TRUE)
+#read in second file once with no headers and no skip
+tempDF <- read.csv("Category_descriptions.csv", header = FALSE, sep = ",", quote = "\"", fill = TRUE,)
+names(tempDF) <- tempDF[2,]
+x <- tempDF[1,]
+#read in second file with second line as headers
+catDF <- read.csv("Category_descriptions.csv", header = TRUE, sep = ",", quote = "\"", fill = TRUE, skip = 1)
+#merge frames
+catDF <- rbind(catDF,tempDF[1,])
+head(df,20)
+head(catDF)
+```
+##   	Clean the data
+
+a.	Check the dates in R, to do this you will have to learn a little bit about handling dates. Check out the as.date() function https://www.statmethods.net/input/dates.html
+b.	Check that the drug names match, look for capitalization issues and abbreviations, add the category descriptions from the Category_descriptions file to the dataframe that you are using. How many doxorubicin, cisplatin, 5-FU, and cisplatin oservations are there?
+c.	Are there missing values? If you omit them does it bias anything?
+
+```{r}
+
+#Fix Dates
+dateA <- as.Date(df$Date,format = "%m/%d/%Y")
+dateB <- as.Date(df$Date,format = "%b-%d-%Y")
+#dateC <- as.Date(df$Date,format = "%d-%b")
+dateA[is.na(dateA)] <- dateB[!is.na(dateB)] #|| dateC[!is.na(dateC)]
+df$Date <- dateA
+head(df$Date,20)
+
+#Capitalize First Char of Drug
+df$Drug <- tolower(df$Drug)
+
+#fix cyclohex
+df$Drug <- sapply(df$Drug,function(x){ ifelse(any(x == "cyclohex"),"cyclohexamide", x)})
+
+#Add Categorical Descriptions
+catDF$Drug <- tolower(catDF$Drug_name)
+
+#fix more file erros
+catDF$Drug <- sapply(catDF$Drug,function(x){ ifelse(any(x == "5-fu"),"5-fluorouracil", x)})
+catDF$Drug <- sapply(catDF$Drug,function(x){ ifelse(any(x == "vinolrebine"),"vinorelbine", x)})
+catDF$Drug <- sapply(catDF$Drug,function(x){ ifelse(any(x == "mitomycinc"),"mitomycin-c", x)})
+
+#merge categories with the main dataframe
+df$Flag_DNAdamage <- with(df, catDF$Flag_DNAdamage[match(Drug,catDF$Drug)])
+df$DNAdamage <- with(df, catDF$DNAdamage[match(Drug,catDF$Drug)])
+df$Flag_multiclass <- with(df, catDF$Flag_multiclass[match(Drug,catDF$Drug)])
+df$More_detail_mech <- with(df, catDF$More_detail_mech[match(Drug,catDF$Drug)])
+
+#clear NAs
+clean_DF <- na.omit(df)
+#re order rows
+row.names(clean_DF) <- 1:nrow(clean_DF)
+summary(clean_DF)
+
+```
+Doxorubicin : 139
+cisplatin : 40
+5-FU : 159
+
+I saved the data that I could by fixing the erros in the files. Most of the data that is erased by the na.omit() is from drugs that were not in the categories data frame so I do not see there being much bias from erasing them. 
+
+
+```{r}
+```
+##  	QC the data
+
+*note that 5-FU, Doxorubicin and Cisplatin were run MANY times.
+a.	Is there a trend for any shp53 or shCHK2 versus %death?
+b.	If there are trends, what should you do?
+  i.	You could correct the data for the systematic trend with regression
+  ii.	How would this work? Try it for one drug. Can you produce a plot that eliminates a trend between        increasing % death and increasing shp53 for doxorubicin? 
+
+
+```{r}
+summary(clean_DF)
+plot(clean_DF$shP53,clean_DF$X.Dead)
+plot(clean_DF$shCHK2,clean_DF$X.Dead)
+#filter for doxorubicine
+doxDat =  clean_DF %>% filter(Drug == "doxorubicin")
+
+#Fix data with linear regression
+shP53XDeadLM <- lm(shP53 ~ X.Dead,data = doxDat)
+shP53XDeadLM 
+#plot data
+plot(doxDat$X.Dead,doxDat$shP53)
+abline(shP53XDeadLM)
+
+#detrend
+doxDat$shP53 <- detrend(doxDat$shP53, tt = 'linear')
+
+#plot detrended data
+plot(doxDat$X.Dead,doxDat$shP53)
+abline(shP53XDeadLM)
+
+```
+there is a positive linear trend as shown in the plot. 
+The data should be detrended to remove the trend
+I corrected the trend by finding the coefficient using a linear regression then detrending by the regression.
+
+```{r}
+```
+
+##    What is the average distance between drugs in the same category using a Euclidean metric or a Correlation metric for the categories in “Category_description”
+
+```{r}
+
+#use aggregate to find euclidean metrics
+testDat <- aggregate(clean_DF,list(clean_DF$Drug),mean)
+
+testDat
+
+```
+The euclidean metrics were found using a mean for each sh value by drug. 
+
+```{r}
+```
+#     Build multiple binary classifiers for DNA damage versus not DNA damage. Note that this is a 2 class problem
+a.	Used LDA, Logistic Regression, K-nearest neighbors (pick k by cross val),Random Forests
+b.	Which model is the most predictive by cross validation?
+c.	Which predictors are useful to infer DNAdamage or not? 
+d.	Perform model selection by cross validation. Eliminate features Examine performance on a test set. Which sh did you include in your final model and why?
+
+```{r}
+
+#set numerics
+clean_DF$shP53 <- as.numeric(clean_DF$shP53)
+clean_DF$shCHK2 <- as.numeric(clean_DF$shCHK2)
+clean_DF$shATR <- as.numeric(clean_DF$shATR)
+clean_DF$shCHK1 <- as.numeric(clean_DF$shCHK1)
+clean_DF$shATX <- as.numeric(clean_DF$shATX)
+clean_DF$shDNAPK <- as.numeric(clean_DF$shDNAPK)
+clean_DF$shBOK <- as.numeric(clean_DF$shBOK)
+clean_DF$shBIM <- as.numeric(clean_DF$shBIM)
+
+#subset data for modeling
+dat <- cbind(clean_DF[4:13])
+#bin DNA as binary value and factor
+dat$binDNA <- as.factor(sapply(dat$Flag_DNAdamage,function(x){ ifelse(any(x == "1"),0, 1)}))
+
+#k fold cross validation
+kx <- 10
+
+#error matrix
+errMat <- matrix(nrow = kx,ncol = 6)
+for(i in 0:nrow(errMat)){
+  
+
+
+  trainidx <- sample(1:nrow(dat), nrow(dat), replace = TRUE) #Sample only from sh cols  instead. Also use kmeans
+  #split data to train and test
+  test <- dat[-trainidx,]
+  train <- dat[trainidx,]
+  class(test)
+  train_Flag <- dat$binDNA[-trainidx]
+  
+  
+if(i < kx-1){
+  
+    #LDA model
+    LDA_Fit <- lda(binDNA ~ shP53 + shCHK2 + shATR + shCHK1 + shATX + shDNAPK + shBIM + shBOK, data = train)
+    LDA_Pred <- predict(LDA_Fit,test)
+    LDA_class <- LDA_Pred$class
+    LDA_tbl <- table(LDA_class,train_Flag)
+    errMat[i,2] <- 1- mean(LDA_class == train_Flag)
+    
+    #logistic regression model
+    logReg_Fit <- glm(binDNA ~ shP53 + shCHK2 + shATR + shCHK1 + shATX + shDNAPK + shBIM + shBOK, data = train,family = "binomial")
+    
+    logReg_Pred <- predict(logReg_Fit,test)
+    #LogReg_tbl <- table(logReg_Pred,train)
+    errMat[i,3] <- 1 - mean(logReg_Pred == train)
+    
+    #split data for knn
+    knn_train <- cbind(dat$shP53,dat$shCHK2,dat$shATR,dat$shCHK1,dat$shATX,dat$shDNAPK,dat$shBOK,dat$shBIM)[1:450,]
+    knn_test <- cbind(dat$shP53,dat$shCHK2,dat$shATR,dat$shCHK1,dat$shATX,dat$shDNAPK,dat$shBOK,dat$shBIM)[450:577,]
+    
+    knn_train_label <- dat$binDNA[1:450]
+    knn_test_label <- dat$binDNA[450:577]
+    
+    
+    
+    #create a matrix to store the k value and error
+    knnMat <- matrix(data = 0, nrow = 4, ncol = 2)
+    set.seed(1)
+    knn_pred <- knn(knn_train,knn_test,knn_train_label,k = 1)
+    
+    knnErr1 <- 1-mean(knn_pred == test$Flag_DNAdamage)
+    
+    knnMat[1,1]<- 1
+    knnMat[1,2] <- knnErr1
+    
+    knn_pred <- knn(knn_train,knn_test,knn_train_label,k = 2)
+    knnErr2 <- 1-mean(knn_pred == test$Flag_DNAdamage)
+    
+    knnMat[2,1] <- 2
+    knnMat[2,2] <- knnErr2
+    
+    knn_pred <- knn(knn_train,knn_test,knn_train_label,k = 5)
+    knnErr3 <- 1-mean(knn_pred == test$Flag_DNAdamage)
+    
+    knnMat[3,1] <- 5
+    knnMat[3,2] <- knnErr3
+    
+    knn_pred <- knn(knn_train,knn_test,knn_train_label,k = 10)
+    knnErr4 <- 1-mean(knn_pred == test$Flag_DNAdamage)
+    
+    knnMat[4,1] <- 10
+    knnMat[4,2] <- knnErr4
+    
+    knnMat <- data.frame(knnMat)
+    #errMat[i,4] <- which.max(knnMat[2])
+    #errmat[i,5] <- 1#the corresponding k value
+    
+  }
+    
+}
+errMat
+
+#random forest tree
+tree_X <- tree(binDNA ~ shP53 + shCHK2 + shATR + shCHK1 + shATX + shDNAPK + shBIM + shBOK, train )
+
+tree.pred <- predict ( tree_X,test ,type ="class")
+summary(tree_X)
+#was going to do prune tree but it only needed 1 variable
+
+plot(tree_X)
+
+
+```
+##    How sensitive is the data to individual drugs with lots of observations?
+a.	If you build the classifier without Doxorubicin, what % of Doxorubicin observations classify as DNA damage and what percent dont.
+b.	Does a. change if you the result from 2.b.ii
+c.	If you build the classifier without 5-FU, what % of 5-FU classify as DNA damage, and what percent don’t?
+
+```{r}
+#filter out doxorubicin
+dfNoDox <-  clean_DF %>% filter(Drug != "doxorubicin")
+#set data as factor
+dfNoDox$binDNA <- as.factor(sapply(dfNoDox$Flag_DNAdamage,function(x){ ifelse(any(x == "1"),0, 1)})) # df or dat?
+datNoDox <- cbind(dfNoDox[4:16])
+#sample data
+trainidxNDX <- sample(1:nrow(datNoDox), nrow(datNoDox), replace = TRUE) #Sample only from sh cols instead. Also use kmeans
+  
+#split data so that train has no dox but test does
+testNDX <- dat[-trainidxNDX,]
+trainNDX <- datNoDox[trainidxNDX,]
+class(testNDX)
+train_FlagNDX <- datNoDox$binDNANDX[-trainidxNDX]
+
+
+tree_NDX <- tree(binDNA ~ shP53 + shCHK2 + shATR + shCHK1 + shATX + shDNAPK + shBIM + shBOK, trainNDX)
+summary(tree_NDX)
+tree.predNDX = predict(tree_NDX,testNDX,type ="class")
+    
+tree_D <- tree(binDNA ~ shP53 + shCHK2 + shATR + shCHK1 + shATX + shDNAPK + shBIM + shBOK, trainNDX )
+summary(tree_D)
+tree.predD <- predict(tree_D,test,type ="class")
+#cvTree <- cv.tree(tree_D, FUN = prune.misclass)
+#pruneTreeD <- prune.misclass (tree_D ,best =3)
+#tree.predD <- predict ( pruneTreeD,test ,type ="class")
+
+
+#repeat for 5FU
+
+dfNo5FU <-  clean_DF %>% filter(Drug == "5-fluorouracil")
+dfNo5FU$binDNA <- as.factor(sapply(dfNo5FU$Flag_DNAdamage,function(x){ ifelse(any(x == "1"),0, 1)}))
+
+datNo5FU <- cbind(dfNo5FU[4:16])
+
+
+trainidxN5F <- sample(1:nrow(datNo5FU), nrow(datNo5FU), replace = TRUE) #Sample only from sh cols instead. Also use kmeans
+  
+testN5F <- dat[-trainidxN5F,]
+trainN5F <- datNo5FU[trainidxN5F,]
+class(testN5F)
+train_FlagN5F <- datNo5FU$binDNANDX[-trainidxN5F]
+  
+tree_F <- tree(binDNA ~ shP53 + shCHK2 + shATR + shCHK1 + shATX + shDNAPK + shBIM + shBOK,trainN5F )
+summary(tree_F)
+tree.predF <- predict(tree_F,test,type ="class")
+#cvTree <- cv.tree(tree_F, FUN = prune.misclass)
+#pruneTreeF <- prune.misclass (tree_F ,best =3)
+#tree.predF <- predict ( pruneTreeF,test ,type ="class")
+
+
+
+```
+The trees perform perfectly with no misclassifications in the data, regardless of training with the drugs. This is because shCHK2 was an extremely good indicator of DNA damage
+```{r}
+```
+##  	Build multiclass classifiers for all levels of categories in the category descriptions
+a.	Use multiclass K-NN, LDA, and Random forests
+b.	If you make predictions for all drugs in the data set that aren’t in the category descriptions, what predictions do you get?
+c.	Do you believe your predictions? Examine at least 2 drugs carefully. Use unsupervised methods to examine the data.
+
+```{r}
+
+datMC <- cbind(clean_DF[4:14])
+
+#alter train,test to use flag for mc prediction and make unsupervised models
+datMC$mcFlag <- as.factor(datMC$Flag_multiclass)
+
+#Need to bootstrap or random sample bc data is not time series
+#train = dat[506,]
+
+
+
+  trainidxMC <- sample(1:nrow(datMC), nrow(datMC), replace = TRUE) #Sample only from sh cols instead. Also use kmeans
+  
+  testMC <- datMC[-trainidxMC,]
+  trainMC <- datMC[trainidxMC,]
+  class(testMC)
+  train_FlagMC <- datMC$mcFlag[-trainidxMC]
+  
+    LDA_FitMC <- lda(mcFlag ~ shP53 + shCHK2 + shATR + shCHK1 + shATX + shDNAPK + shBIM + shBOK, data = trainMC )
+    
+    LDA_PredMC <- predict(LDA_FitMC,testMC)
+    LDA_classMC <- LDA_PredMC$class
+    LDA_tblMC <- table(LDA_classMC,train_FlagMC)
+    1- mean(LDA_classMC == train_FlagMC)
+    
+    
+    #train_knn <- Year(2014)
+    knn_trainMC <- cbind(datMC$shP53,datMC$shCHK2,datMC$shATR,datMC$shCHK1,datMC$shATX,datMC$shDNAPK,datMC$shBOK,datMC$shBIM)[1:450,]
+    knn_testMC <- cbind(datMC$shP53,datMC$shCHK2,datMC$shATR,datMC$shCHK1,datMC$shATX,datMC$shDNAPK,datMC$shBOK,datMC$shBIM)[450:577,]
+    
+    knn_train_labelMC <- datMC$mcFlag[1:450]
+    knn_test_labelMC <- datMC$mcFlag[450:577]
+    
+    
+    
+    
+    set.seed(1)
+    knn_predMC <- knn(knn_trainMC,knn_testMC,knn_train_labelMC,k = 1)
+    
+    1-mean(knn_predMC == knn_test_labelMC)
+    
+    knn_pred2MC <- knn(knn_trainMC,knn_testMC,knn_train_labelMC,k = 2)
+    1-mean(knn_pred2MC == knn_test_labelMC)
+    
+    knn_pred3MC <- knn(knn_trainMC,knn_testMC,knn_train_labelMC,k = 5)
+    knnErr3MC <- 1-mean(knn_pred3MC == knn_test_labelMC)
+    
+   
+    knn_pred4MC <- knn(knn_trainMC,knn_testMC,knn_train_labelMC,k = 10)
+    1-mean(knn_pred4MC == knn_test_labelMC)
+    
+    
+
+tree_XMC <- tree(mcFlag ~ shP53 + shCHK2 + shATR + shCHK1 + shATX + shDNAPK + shBIM + shBOK, trainMC )
+
+tree.predMC <- predict( tree_XMC,testMC,type ="class")
+cvTreeMC <- cv.tree(tree_XMC, FUN = prune.misclass)
+pruneTreeMC <- prune.misclass (tree_XMC ,best =3)
+tree.predMC <- predict ( pruneTreeMC,testMC ,type ="class")
+
+
+summary(tree_XMC)
+plot(tree_XMC)
+
+#PCA
+quantE <- cbind(dat[1:8])
+drugDat <- cbind(clean_DF$Drug,clean_DF[4:11])
+drugDat$Drug <- drugDat$`clean_DF$Drug`
+PC<-prcomp(quantE,center = TRUE,scale=TRUE)#What does this do? Why is scaling and centering important?
+(PC$sdev)^2 / sum(PC$sdev^2) #Proportion of variance by PC
+#
+drugdat5= cbind(as.data.frame(PC$x),drugDat$Drug)
+
+
+
+x=ggplot(drugdat5,aes(x=PC1,y=PC2,col='drugDat$Drug'))
+x+geom_point(size=5,alpha=0.8)+ #Size and alpha just for fun
+  theme(axis.text.y=element_text(colour="black",size=18))+
+  theme(axis.text.x=element_text(colour="black",size=18))+
+  theme(axis.title.y=element_text(size=18))+
+  theme(axis.title.x=element_text(size=18))+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  theme(panel.border = element_blank())+
+  theme(panel.background = element_blank())+
+  theme(axis.line = element_line(colour = "black",size=1))
+
+#kmeans
+
+#examine cyclohexamide and saha
+kDat <- as.data.frame(cbind(clean_DF$shP53,clean_DF$shCHK2,clean_DF$shATR,clean_DF$shCHK1,clean_DF$shATX,clean_DF$shDNAPK,clean_DF$shBOK,clean_DF$shBIM))
+#unique(factor(clean_DF$Drug)) # 30
+class(kDat)
+
+km <- kmeans(as.matrix(kDat),30,nstart = 25)
+summary(km)
+km$cluster <- as.factor(km$cluster)
+plot(km$cluster)
+#ggplot(kDat,x=PC1,y=PC2,aes(color = km$cluster)) + geom_point()
+
+#x=ggplot(kDat,aes(x=nrow(kDat),y=ncol(kDat),col=km$cluster))
+#x+geom_point(size=5,alpha=0.8)+ #Size and alpha just for fun
+  # theme(axis.text.y=element_text(colour="black",size=18))+
+  # theme(axis.text.x=element_text(colour="black",size=18))+
+  # theme(axis.title.y=element_text(size=18))+
+  # theme(axis.title.x=element_text(size=18))+
+  # theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  # theme(panel.border = element_blank())+
+  # theme(panel.background = element_blank())+
+  # theme(axis.line = element_line(colour = "black",size=1))
+
+
+```
+
+The models all had around a 5 to 20% error but the random forest performed extremely well. 
+Random forest would be able to predict for the drugs not in the cataegory data set, also. 
+The tree used more nodes than in the other sections.
+
+```{r}
+```
+
+##Conclusion
+
+In conclusion, I learned a lot about data science altogether. I learned about quality controlling the data and the trade-offs with getting precise, clean, usable, and unbiased data. I learned the advantages and disadvantages of using binary and multi-class classifiers as well as un/supervised learning. I learned how to evaluate my results and to tell what is believable and what is not. I also learned that sometimes certain variables have particularly strong correlations. 
+
+As I take this new skill set into future projects, I will be more conscious about taking into consideration the models that I use and the data that I put into them. 
+
+
+
+
+
+
+
+
+
+
+
+
+
